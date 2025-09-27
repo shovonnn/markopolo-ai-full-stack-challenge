@@ -4,6 +4,10 @@ import { nanoid } from 'nanoid';
 import { ShopifyAdapter } from './adapters/ShopifyAdapter.js';
 import { WebsiteAdapter } from './adapters/WebsiteAdapter.js';
 import { FacebookPageAdapter } from './adapters/FacebookPageAdapter.js';
+import { EmailProvider } from './channels/EmailProvider.js';
+import { SMSProvider } from './channels/SMSProvider.js';
+import { WhatsAppProvider } from './channels/WhatsAppProvider.js';
+import { AdsProvider } from './channels/AdsProvider.js';
 
 const app = express();
 app.use(cors());
@@ -20,6 +24,10 @@ const connections = {
   dataSources: [],
   channels: []
 };
+
+// Channel registry and in-memory state
+const channels = [new EmailProvider(), new SMSProvider(), new WhatsAppProvider(), new AdsProvider()];
+const channelState = /** @type {Record<string, any>} */ ({}); // keyed by channel.id
 
 app.get('/health', (_, res) => res.json({ ok: true }));
 
@@ -58,14 +66,46 @@ app.post('/adapters/:id/disconnect', async (req, res) => {
   }
 });
 
-// Connect channels (data sources are driven by adapters)
-app.post('/connect', (req, res) => {
-  const { channels = [] } = req.body || {};
-  const allowedChannels = new Set(['Email', 'SMS', 'WhatsApp', 'Ads']);
-  const selectedChannels = [...new Set(channels)].filter(c => allowedChannels.has(c)).slice(0, 4);
-  connections.channels = selectedChannels;
+// List channels
+app.get('/channels', (_req, res) => {
+  res.json({ ok: true, channels: channels.map(c => c.getStatus(channelState[c.id])) });
+});
+
+// Connect a channel
+app.post('/channels/:id/connect', async (req, res) => {
+  const id = req.params.id;
+  const provider = channels.find(c => c.id === id);
+  if (!provider) return res.status(404).json({ ok: false, error: 'Channel not found' });
+  try {
+    const next = await provider.connect(req.body, channelState[id]);
+    channelState[id] = { ...(channelState[id] || {}), ...next };
+    syncChannelsFromState();
+    res.json({ ok: true, status: provider.getStatus(channelState[id]) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Disconnect a channel
+app.post('/channels/:id/disconnect', async (req, res) => {
+  const id = req.params.id;
+  const provider = channels.find(c => c.id === id);
+  if (!provider) return res.status(404).json({ ok: false, error: 'Channel not found' });
+  try {
+    const next = await provider.disconnect(channelState[id]);
+    channelState[id] = { ...(channelState[id] || {}), ...next };
+    syncChannelsFromState();
+    res.json({ ok: true, status: provider.getStatus(channelState[id]) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Legacy connect kept for compatibility: no-op aside from returning current selections
+app.post('/connect', (_req, res) => {
   syncDataSourcesFromState();
-  res.json({ ok: true, dataSources: connections.dataSources, channels: selectedChannels });
+  syncChannelsFromState();
+  res.json({ ok: true, dataSources: connections.dataSources, channels: connections.channels });
 });
 
 // Stream structured decision frames (SSE): steps 1-4, then final executable spec
@@ -112,6 +152,7 @@ app.get('/stream-campaign', async (req, res) => {
       payload: {
         dataSources: connections.dataSources,
         adapterSnapshots,
+        channels: connections.channels,
         audiences: audiences.map(a => ({
           segmentId: `seg_${a.key}`,
           key: a.key,
@@ -381,4 +422,17 @@ function syncDataSourcesFromState() {
     .filter(([, v]) => v?.connected)
     .map(([k]) => idToName[k] || k);
   connections.dataSources = connected.slice(0, 3);
+}
+
+function syncChannelsFromState() {
+  const idToName = {
+    email: 'Email',
+    sms: 'SMS',
+    whatsapp: 'WhatsApp',
+    ads: 'Ads'
+  };
+  const connected = Object.entries(channelState)
+    .filter(([, v]) => v?.connected)
+    .map(([k]) => idToName[k] || k);
+  connections.channels = connected.slice(0, 4);
 }

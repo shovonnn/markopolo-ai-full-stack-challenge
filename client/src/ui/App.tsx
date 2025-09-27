@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { MessageList } from './MessageList'
-import { ChannelSelector } from './ChannelSelector'
+// import { ChannelSelector } from './ChannelSelector'
 import { Adapters } from './Adapters'
+import { Channels } from './Channels'
 import './styles.css'
 
-const ALL_CHANNELS = ['Email', 'SMS', 'WhatsApp', 'Ads'] as const
+// const ALL_CHANNELS = ['Email', 'SMS', 'WhatsApp', 'Ads'] as const
 
 export function App() {
   type StepFrame = { decision_id: string; step: number; name: string; payload: unknown; kind?: 'step'|'final' }
@@ -17,30 +18,26 @@ export function App() {
   type AdapterStatus = { id: string; name: string; description: string; icon: string; connected: boolean }
   const [adapters, setAdapters] = useState<AdapterStatus[]>([])
   const connectedSources = adapters.filter(a => a.connected).map(a => a.name)
-  const [selectedChannels, setSelectedChannels] = useState<string[]>([])
+  type ChannelStatus = { id: string; name: string; description: string; icon: string; connected: boolean }
+  const [channels, setChannels] = useState<ChannelStatus[]>([])
   const [streaming, setStreaming] = useState(false)
   const streamIdxRef = useRef<number | null>(null)
-
-  const canConnect = useMemo(() => connectedSources.length > 0 && selectedChannels.length > 0, [connectedSources, selectedChannels])
 
   async function refreshAdapters() {
     const res = await fetch('/api/adapters')
     const json = await res.json()
     setAdapters(json.adapters || [])
   }
+  async function refreshChannels() {
+    const res = await fetch('/api/channels')
+    const json = await res.json()
+    setChannels(json.channels || [])
+  }
 
   useEffect(() => {
-    refreshAdapters()
+    refreshAdapters();
+    refreshChannels();
   }, [])
-
-  async function handleConnect() {
-    const res = await fetch('/api/connect', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channels: selectedChannels })
-    })
-    const json = await res.json()
-    setSelectedChannels(json.channels)
-  }
 
   async function connectAdapter(id: string) {
     await fetch(`/api/adapters/${id}/connect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
@@ -49,6 +46,14 @@ export function App() {
   async function disconnectAdapter(id: string) {
     await fetch(`/api/adapters/${id}/disconnect`, { method: 'POST' })
     await refreshAdapters()
+  }
+  async function connectChannel(id: string) {
+    await fetch(`/api/channels/${id}/connect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
+    await refreshChannels()
+  }
+  async function disconnectChannel(id: string) {
+    await fetch(`/api/channels/${id}/disconnect`, { method: 'POST' })
+    await refreshChannels()
   }
 
   async function handleSend() {
@@ -120,13 +125,7 @@ export function App() {
       <aside className="sidebar">
         <h2>Connections</h2>
         <Adapters adapters={adapters} onConnect={connectAdapter} onDisconnect={disconnectAdapter} />
-        <ChannelSelector
-          allChannels={ALL_CHANNELS as unknown as string[]}
-          selected={selectedChannels}
-          onChange={setSelectedChannels}
-        />
-        <button className="connect" disabled={!canConnect} onClick={handleConnect}>Connect</button>
-        <div className="hint">Pick up to 3 data sources and up to 4 channels.</div>
+        <Channels channels={channels} onConnect={connectChannel} onDisconnect={disconnectChannel} />
       </aside>
       <main className="chat">
         <header className="topbar">Campaignity</header>
