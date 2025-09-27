@@ -1,6 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import { nanoid } from 'nanoid';
+import { ShopifyAdapter } from './adapters/ShopifyAdapter.js';
+import { WebsiteAdapter } from './adapters/WebsiteAdapter.js';
+import { FacebookPageAdapter } from './adapters/FacebookPageAdapter.js';
 
 const app = express();
 app.use(cors());
@@ -8,7 +11,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5174;
 
-// Simulate a connection registry in-memory
+// Adapter registry and in-memory connection state
+const adapters = [new ShopifyAdapter(), new WebsiteAdapter(), new FacebookPageAdapter()];
+const connectionState = /** @type {Record<string, any>} */ ({}); // keyed by adapter.id
+
+// App-level selection state (channels + derived data source names)
 const connections = {
   dataSources: [],
   channels: []
@@ -16,24 +23,53 @@ const connections = {
 
 app.get('/health', (_, res) => res.json({ ok: true }));
 
-// Connect data sources (Website, Shopify, Facebook Page)
+// List available adapters and their connection status
+app.get('/adapters', (_req, res) => {
+  res.json({ ok: true, adapters: adapters.map(a => a.getStatus(connectionState[a.id])) });
+});
+
+// Connect an adapter (mock auth)
+app.post('/adapters/:id/connect', async (req, res) => {
+  const id = req.params.id;
+  const adapter = adapters.find(a => a.id === id);
+  if (!adapter) return res.status(404).json({ ok: false, error: 'Adapter not found' });
+  try {
+    const next = await adapter.connect(req.body, connectionState[id]);
+    connectionState[id] = { ...(connectionState[id] || {}), ...next };
+    syncDataSourcesFromState();
+    res.json({ ok: true, status: adapter.getStatus(connectionState[id]) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Disconnect an adapter
+app.post('/adapters/:id/disconnect', async (req, res) => {
+  const id = req.params.id;
+  const adapter = adapters.find(a => a.id === id);
+  if (!adapter) return res.status(404).json({ ok: false, error: 'Adapter not found' });
+  try {
+    const next = await adapter.disconnect(connectionState[id]);
+    connectionState[id] = { ...(connectionState[id] || {}), ...next };
+    syncDataSourcesFromState();
+    res.json({ ok: true, status: adapter.getStatus(connectionState[id]) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Connect channels (data sources are driven by adapters)
 app.post('/connect', (req, res) => {
-  const { dataSources = [], channels = [] } = req.body || {};
-  // Validate selection
-  const allowedSources = new Set(['Website', 'Shopify', 'Facebook Page']);
+  const { channels = [] } = req.body || {};
   const allowedChannels = new Set(['Email', 'SMS', 'WhatsApp', 'Ads']);
-
-  const selectedSources = [...new Set(dataSources)].filter(s => allowedSources.has(s)).slice(0, 3);
   const selectedChannels = [...new Set(channels)].filter(c => allowedChannels.has(c)).slice(0, 4);
-
-  connections.dataSources = selectedSources;
   connections.channels = selectedChannels;
-
-  res.json({ ok: true, dataSources: selectedSources, channels: selectedChannels });
+  syncDataSourcesFromState();
+  res.json({ ok: true, dataSources: connections.dataSources, channels: selectedChannels });
 });
 
 // Stream structured decision frames (SSE): steps 1-4, then final executable spec
-app.get('/stream-campaign', (req, res) => {
+app.get('/stream-campaign', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -44,6 +80,13 @@ app.get('/stream-campaign', (req, res) => {
 
   const now = new Date();
   const audiences = deriveAudiences(connections.dataSources);
+  const connectedAdapters = adapters.filter(a => connectionState[a.id]?.connected);
+  const adapterSnapshots = await Promise.all(
+    connectedAdapters.map(async (a) => {
+      const snap = await a.fetchSnapshot(connectionState[a.id]);
+      return { id: a.id, name: a.name, icon: a.icon, signals: snap?.signals || {} };
+    })
+  );
   const governance = {
     frequencyCaps: { perUserPerDay: 2 },
     quietHours: { start: '21:00', end: '08:00', timezone: 'local' },
@@ -68,6 +111,7 @@ app.get('/stream-campaign', (req, res) => {
       name: 'context_audience',
       payload: {
         dataSources: connections.dataSources,
+        adapterSnapshots,
         audiences: audiences.map(a => ({
           segmentId: `seg_${a.key}`,
           key: a.key,
@@ -326,3 +370,15 @@ function rightMessage(channel, audience) {
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
 });
+
+function syncDataSourcesFromState() {
+  const idToName = {
+    shopify: 'Shopify',
+    website: 'Website',
+    facebook_page: 'Facebook Page'
+  };
+  const connected = Object.entries(connectionState)
+    .filter(([, v]) => v?.connected)
+    .map(([k]) => idToName[k] || k);
+  connections.dataSources = connected.slice(0, 3);
+}
